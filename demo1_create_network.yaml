@@ -1,0 +1,123 @@
+# Heat template file which autoimatically does the following:
+# - A VM instance
+# - A Private Network
+# - A public facing IP assigned to the VM instance
+# - Allow an ssh login from a system outside of the OpenStack environment
+
+heat_template_version: 2017-02-24
+
+description: >
+  Heat template creating a VM having private and floating IP and ssh access
+
+parameters:
+  key_name:
+    type: string
+    description: Key pair to use for the server
+    default: heat_key
+  flavor:
+    type: string
+    description: Flavor to use for the server
+    default: m1.medium
+  image:
+    type: string
+    description: Image to use for the server
+    default: xenial
+  private_net_name:
+    type: string
+    description: Private network to create for the server
+    default: demo-net
+  private_subnet_name:
+    type: string
+    description: Sub network to create for the Private network
+    default: demo-subnet
+  private_net_cidr:
+    type: string
+    description: CIDR to use for the Sub network
+    default: 10.0.10.0/24
+  private_net_gateway:
+    type: string
+    description: Private network gateway to use for the Sub network
+    default: 10.0.10.1
+  private_net_pool_start:
+    type: string
+    description: Private network pool start to use for Sub network
+    default: 10.0.10.2
+  private_net_pool_end:
+    type: string
+    description: Private network pool end to use for Sub network
+    default: 10.0.10.254
+  router_name:
+    type: string
+    description: Router to be connect to Private network
+    default: demo-router
+  public_net:
+    type: string
+    description: Public network to use for the server
+    default: ext-net
+
+resources:
+
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: { get_param: private_net_name }
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: { get_param: private_subnet_name }
+      network_id: { get_resource: private_net }
+      cidr: { get_param: private_net_cidr }
+      gateway_ip: { get_param: private_net_gateway }
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param: private_net_pool_end }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_param: router_name }
+      subnet_id: { get_resource: private_subnet }
+
+  external_access:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: external_access
+      description: Ping and SSH
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+
+  public_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+      - subnet_id: { get_resource: private_subnet }
+      security_groups:
+      - {get_resource: external_access}
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: public_port }
+
+
+  demo_instance:
+    type: OS::Nova::Server
+    properties:
+      key_name: { get_param: key_name }
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      networks:
+        - port: { get_resource: public_port }
+
+outputs:
+  server_networks:
+    description: The networks of the deployed server
+    value: { get_attr: [demo_instance, networks] }

@@ -1,0 +1,316 @@
+heat_template_version: 2017-02-24
+
+description: >
+  Heat template to deploy WebApp on two instances using Heat's
+  software orchestration feature.
+
+parameters:
+  key_name:
+    type: string
+    description: Key pair to use for the server
+    default: heat_key
+  flavor:
+    type: string
+    description: Flavor to use for the server
+    default: m1.medium
+  image:
+    type: string
+    description: Image to use for the server
+    default: xenial
+  private_net_name:
+    type: string
+    description: Private network to create for the server
+    default: demo-net
+  private_subnet_name:
+    type: string
+    description: Sub network to create for the Private network
+    default: demo-subnet
+  private_net_cidr:
+    type: string
+    description: CIDR to use for the Sub network
+    default: 10.0.10.0/24
+  private_net_gateway:
+    type: string
+    description: Private network gateway to use for the Sub network
+    default: 10.0.10.1
+  private_net_pool_start:
+    type: string
+    description: Private network pool start to use for Sub network
+    default: 10.0.10.2
+  private_net_pool_end:
+    type: string
+    description: Private network pool end to use for Sub network
+    default: 10.0.10.254
+  router_name:
+    type: string
+    description: Router to be connect to Private network
+    default: demo-router
+  public_net:
+    type: string
+    description: Public network to use for the server
+    default: ext-net
+  nameserver_ip1:
+    type: string
+    description: IP of the dns nameserver1.
+    default: 134.9.1.1
+  db_username:
+    type: string
+    description: The WebApp database test account username
+    default: testuser
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 16 }
+        description: db_username must be between 1 and 64 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_username must begin with a letter and contain only alphanumeric
+          characters
+  db_root_password:
+    type: string
+    description: The WebApp database test account password
+    default: test123
+  db_password:
+    type: string
+    description: WebApp database test account password
+    default: test123
+  ceph_obj_url:
+    type: string
+    description: url for ceph object
+    default: 192.168.64.27
+  volume_size:
+    type: number
+    description: Size of the volume to be created.
+    default: 5
+    constraints:
+      - range: { min: 1, max: 1024 }
+        description: must be between 1 and 1024 Gb.
+  volume_mountpoint:
+    type: string
+    description: The location where the volume is exposed on the instance.
+    default: /dev/vdb
+  database_mountpoint:
+    type: string
+    description: The location where the database volume will be mounted
+    default: /mnt/mysql
+  webappfile:
+    type: string
+    description: The location to download webappfile
+
+resources:
+
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: { get_param: private_net_name }
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: { get_param: private_subnet_name }
+      network_id: { get_resource: private_net }
+      cidr: { get_param: private_net_cidr }
+      gateway_ip: { get_param: private_net_gateway }
+      dns_nameservers: [{ get_param: nameserver_ip1 }]
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param: private_net_pool_end }
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_param: router_name }
+      subnet_id: { get_resource: private_subnet }
+
+  external_access:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: external_access
+      description: Ping and SSH
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 5000
+          port_range_max: 5000
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 3306
+          port_range_max: 3306
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+  internal_access:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: internal_access
+      description: Ping and SSH
+      rules:
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: tcp
+          port_range_min: 3306
+          port_range_max: 3306
+        - remote_ip_prefix: 0.0.0.0/0
+          protocol: icmp
+
+  public_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+      - subnet_id: { get_resource: private_subnet }
+      security_groups:
+      - {get_resource: external_access}
+
+  internal_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+      - subnet_id: { get_resource: private_subnet }
+      security_groups:
+      - {get_resource: internal_access}
+
+  floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net }
+      port_id: { get_resource: public_port }
+
+  cinder_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: volume_size }
+
+  dbserver_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: internal_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            # install MySQL
+            sudo apt-get update
+            sudo apt-get install -y debconf-utils
+            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password password $database_rootpassword"
+            sudo debconf-set-selections <<< "mysql-server mysql-server/root_password_again password $database_rootpassword"
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+            sudo mkfs.ext4 "$mountpoint"
+            sudo mkdir "$database_mountpoint"
+            sudo mount "$mountpoint" "$database_mountpoint"
+            sudo systemctl stop mysql
+            sudo rsync -av /var/lib/mysql "$database_mountpoint"
+            sudo sed -i "s,datadir.*,datadir     = "$database_mountpoint/mysql"," /etc/mysql/mysql.conf.d/mysqld.cnf
+            sudo bash -c "cat <<EOF >> /etc/apparmor.d/tunables/alias
+            alias /var/lib/mysql/ -> "$database_mountpoint/mysql/",
+            EOF"
+            sudo systemctl restart apparmor
+            sudo mkdir /var/lib/mysql/mysql -p
+            # listen on all network interfaces
+            sudo sed -i "s/bind-address.*/bind-address = 0.0.0.0/" /etc/mysql/mysql.conf.d/mysqld.cnf
+            # restart service
+            sudo systemctl restart mysql.service
+            mysql -u root --password="$database_rootpassword" <<EOF
+            CREATE USER '$database_user'@'%';
+            SET PASSWORD FOR '$database_user'@'%'=PASSWORD("$database_password");
+            GRANT ALL PRIVILEGES ON *.* TO '$database_user'@'%' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+          params:
+            $database_rootpassword: {get_param: [db_root_password]}
+            $database_user: {get_param: db_username}
+            $database_password: {get_param: [db_password]}
+            $mountpoint: { get_param: volume_mountpoint }
+            $database_mountpoint: { get_param: database_mountpoint }
+
+  cinder_volume_attachment:
+    type: OS::Cinder::VolumeAttachment
+    properties:
+      volume_id: { get_resource: cinder_volume }
+      instance_uuid: { get_resource: dbserver_instance }
+      mountpoint: { get_param: volume_mountpoint }
+
+  webserver_instance:
+    type: OS::Nova::Server
+    properties:
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: public_port }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            sudo apt-get install -y apache2 python-minimal mysql-client-core-5.7 libapache2-mod-wsgi gcc python-dev
+            wget --no-check-certificate https://bootstrap.pypa.io/get-pip.py
+            sudo python get-pip.py
+            sudo bash -c "cat <<EOF >> /home/ubuntu/requirements.txt
+            Flask == 0.12.2
+            Flask-MySQL==1.4.0
+            Flask-RESTful==0.3.6
+            Flask-Cors==3.0.3
+            python-bcrypt==0.3.2
+            requests==2.18.4
+            EOF"
+            sudo pip install -r /home/ubuntu/requirements.txt
+            wget "$webappfile"
+            tar xvf llnc_app.tar
+            sudo mv llnc_app/backend/ /var/www/
+            sudo rm -rf /var/www/html
+            sudo mv llnc_app/html/ /var/www/
+            mysql --user="$database_user" --password="$database_password" -h $db_ipaddr < /var/www/backend/app_db.sql
+            sudo sed -i "s/app.config\['MYSQL_DATABASE_HOST'\].*/app.config['MYSQL_DATABASE_HOST'] = \"$db_ipaddr\"/" /var/www/backend/backend.py
+            sudo sed -i "s/HOST.*/HOST=\"$ceph_obj_url\"/" /var/www/backend/config.cfg
+            sudo sed -i "s/KEY.*/KEY=\"ekDv4U2V1P9ViHKR0zACbTceBxuu9BXsrgaTcqtj\"/" /var/www/backend/config.cfg
+            sudo sed -i '1s/^/Listen 5000\n/' /etc/apache2/ports.conf
+            sudo bash -c "cat <<EOF >> /etc/apache2/sites-available/000-default.conf
+            <virtualhost *:5000>
+                ServerName web-server
+                WSGIDaemonProcess backend user=www-data group=www-data threads=5 home=/var/www/backend/
+                WSGIScriptAlias / /var/www/backend/backend.wsgi
+                <directory /var/www/backend>
+                    WSGIProcessGroup backend
+                    WSGIApplicationGroup %{GLOBAL}
+                    WSGIScriptReloading On
+                    Order deny,allow
+                    Allow from all
+                </directory>
+            </virtualhost>
+            EOF"
+            sudo rm -rf /var/www/html/index.html /var/www/html/release1/
+            sudo sed -i "s/DocumentRoot.*/DocumentRoot \/var\/www\/html\/dist/" /etc/apache2/sites-available/000-default.conf
+            sudo sed -i "s/\"ip_address\".*/\"ip_address\": \"$floating_ip\"/" /var/www/html/dist/assets/env-specific.json
+            sudo systemctl restart apache2.service
+          params:
+            $database_user: {get_param: db_username}
+            $database_password: {get_param: [db_password]}
+            $network_name: {get_param: private_net_name}
+            $db_ipaddr: { get_attr: [dbserver_instance, first_address] }
+            $ceph_obj_url : {get_param: ceph_obj_url}
+            $floating_ip : { get_attr: [floating_ip, floating_ip_address] }
+            $webappfile : {get_param: webappfile}
+outputs:
+  WebsiteURL:
+    description: URL for Apache web page
+    value:
+      str_replace:
+        template: http://host
+        params:
+          host: { get_attr: [floating_ip, floating_ip_address] }
